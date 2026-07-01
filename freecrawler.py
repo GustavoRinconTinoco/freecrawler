@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 """
-Hermes Scraper v2 — alternativa local a Firecrawl con motor crawl4ai.
-Modos:
-  scrape  <url>            Extrae contenido limpio (Markdown/texto/JSON)
-  crawl   <url>            Descubre y extrae múltiples páginas del mismo sitio
-  map     <url>            Lista todas las URLs internas descubiertas
-  extract <url>            Extrae datos estructurados con schema CSS (JSON)
+Freecrawler — 100% local, free alternative to Firecrawl with crawl4ai engine.
+Modes:
+  scrape  <url>            Extract clean content (Markdown/text/JSON)
+  crawl   <url>            Discover and extract multiple pages from the same site
+  map     <url>            List all discovered internal URLs
+  extract <url>            Extract structured data with CSS schema (JSON)
 
 Flags:
-  --format markdown|text|json   Formato de salida (default: markdown)
-  --schema "selector={...}"     Schema CSS para --json (ej: "h1=title .price=precio")
-  --depth N                Profundidad máxima para crawl (default: 1)
-  --limit N                Máximo de páginas para crawl (default: 10)
-  --browser                Usa navegador real para JS pesado (Playwright)
-  --output ARCHIVO         Guarda a archivo en vez de stdout
-  --quiet                  Solo el contenido, sin metadatos
-  --pretty                 JSON formateado con indentación
+  --format markdown|text|json   Output format (default: markdown)
+  --schema "selector=..."       CSS schema for --json (e.g: "h1=title .price=price")
+  --depth N                Maximum crawl depth (default: 1)
+  --limit N                Maximum pages for crawl (default: 10)
+  --browser                Use real browser for heavy JS (Playwright)
+  --output FILE            Save output to file instead of stdout
+  --quiet                  Content only, no metadata
+  --pretty                 Pretty-printed JSON output
 """
 
 import sys, json, os, time, argparse
@@ -177,20 +177,20 @@ def _scrape_http(url: str, fmt: str = "markdown") -> dict:
         content = trafilatura.extract(html, output_format="txt")
         if not content:
             content = _fallback_extract(soup, fmt="text")
-        result["content"] = content.strip() if content else "[No se pudo extraer contenido]"
+        result["content"] = content.strip() if content else "[No content could be extracted]"
     elif fmt == "markdown":
         import trafilatura
         opts = {"include_formatting": True, "include_links": True, "include_images": False, "output_format": "markdown"}
         content = trafilatura.extract(html, **opts)
         if not content:
             content = _fallback_extract(soup, fmt="markdown")
-        result["content"] = content.strip() if content else "[No se pudo extraer contenido]"
+        result["content"] = content.strip() if content else "[No content could be extracted]"
     else:
         import trafilatura
         content = trafilatura.extract(html, output_format="txt")
         if not content:
             content = _fallback_extract(soup, fmt="text")
-        result["content"] = content.strip() if content else "[No se pudo extraer contenido]"
+        result["content"] = content.strip() if content else "[No content could be extracted]"
 
     result["content_length"] = len(result["content"])
     return result
@@ -239,7 +239,7 @@ async def _scrape_crawl4ai(url: str, fmt: str = "markdown", use_browser: bool = 
             result["data"] = crawl_result.extracted_content or {}
         result["content"] = json.dumps(result["data"], ensure_ascii=False)
     else:
-        result["content"] = crawl_result.markdown or crawl_result.fit_markdown or "[No se pudo extraer contenido]"
+        result["content"] = crawl_result.markdown or crawl_result.fit_markdown or "[No content could be extracted]"
 
     result["content_length"] = len(result["content"])
     return result
@@ -387,42 +387,42 @@ def linkedin_profile(url: str, email: str = None, password: str = None) -> dict:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Hermes Scraper v2 — alternativa local a Firecrawl con JSON, X/Twitter y LinkedIn",
+        description="Freecrawler — 100% local, free alternative to Firecrawl with JSON, X/Twitter and LinkedIn",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Ejemplos:
-  python scraper.py scrape https://ejemplo.com
-  python scraper.py scrape https://ejemplo.com --format text
-  python scraper.py scrape https://ejemplo.com --format json
-  python scraper.py scrape https://ejemplo.com --browser        # JS rendering
-  python scraper.py extract https://ejemplo.com --schema "article: h2=title .price=precio"
-  python scraper.py crawl https://ejemplo.com --depth 2 --limit 20
-  python scraper.py map https://ejemplo.com --depth 1
-  python scraper.py xsearch "Venezuela France" --limit 5
-  python scraper.py xuser @Gustavo34965333 --limit 10
-  python scraper.py linkedin https://linkedin.com/in/perfil
+Examples:
+  python freecrawler.py scrape https://example.com
+  python freecrawler.py scrape https://example.com --format text
+  python freecrawler.py scrape https://example.com --format json
+  python freecrawler.py scrape https://example.com --browser        # JS rendering
+  python freecrawler.py extract https://example.com --schema "article: h2=title .price=price"
+  python freecrawler.py crawl https://example.com --depth 2 --limit 20
+  python freecrawler.py map https://example.com --depth 1
+  python freecrawler.py xsearch "artificial intelligence" --limit 5
+  python freecrawler.py xuser @username --limit 10
+  python freecrawler.py linkedin https://linkedin.com/in/profile
         """
     )
     parser.add_argument("mode", choices=["scrape", "crawl", "map", "extract",
                                           "xsearch", "xuser", "linkedin"],
-                        help="Modo de operación")
-    parser.add_argument("url", nargs="?", help="URL (para scrape/crawl/map/extract/linkedin)")
+                        help="Operation mode")
+    parser.add_argument("url", nargs="?", help="URL (for scrape/crawl/map/extract/linkedin)")
     parser.add_argument("--format", choices=["markdown", "text", "json"], default="markdown",
-                        help="Formato de salida (default: markdown)")
-    parser.add_argument("--schema", help="Schema CSS para extract. Formato: 'baseSelector: selector=nombre ...' "
-                        "Ej: 'article.product_pod: h3 a=title .price_color=price'. "
-                        "O JSON: '{\"baseSelector\":\"tr\",\"fields\":[{\"name\":\"x\",\"selector\":\"td\",\"type\":\"text\"}]}'")
+                        help="Output format (default: markdown)")
+    parser.add_argument("--schema", help="CSS schema for extract. Format: 'baseSelector: selector=name ...' "
+                        "e.g: 'article.product_pod: h3 a=title .price_color=price'. "
+                        "Or JSON: '{\"baseSelector\":\"tr\",\"fields\":[{\"name\":\"x\",\"selector\":\"td\",\"type\":\"text\"}]}'")
     parser.add_argument("--depth", type=int, default=1,
-                        help="Profundidad para crawl/map (default: 1)")
+                        help="Crawl/map depth (default: 1)")
     parser.add_argument("--limit", type=int, default=10,
-                        help="Máx resultados/páginas (default: 10)")
+                        help="Max results/pages (default: 10)")
     parser.add_argument("--browser", action="store_true",
-                        help="Usar navegador real (Playwright) para JS pesado")
-    parser.add_argument("--output", "-o", help="Guardar a archivo en vez de stdout")
+                        help="Use real browser (Playwright) for heavy JS")
+    parser.add_argument("--output", "-o", help="Save output to file instead of stdout")
     parser.add_argument("--quiet", "-q", action="store_true",
-                        help="Solo contenido, sin metadatos")
+                        help="Content only, no metadata")
     parser.add_argument("--pretty", action="store_true",
-                        help="JSON formateado con indentación")
+                        help="Pretty-printed JSON output")
 
     args = parser.parse_args()
 
@@ -433,47 +433,47 @@ Ejemplos:
     try:
         if args.mode == "extract":
             if not args.schema:
-                print("ERROR: extract requiere --schema", file=sys.stderr)
+                print("ERROR: extract requires --schema", file=sys.stderr)
                 sys.exit(1)
             result = extract_structured(args.url, args.schema, use_browser=args.browser)
             _emit(result, quiet=args.quiet, pretty=args.pretty, fp=output)
 
         elif args.mode == "scrape":
             if not args.url:
-                print("ERROR: scrape requiere URL", file=sys.stderr)
+                print("ERROR: scrape requires URL", file=sys.stderr)
                 sys.exit(1)
             result = scrape(args.url, fmt=args.format, use_browser=args.browser, schema_str=args.schema)
             _emit(result, quiet=args.quiet, pretty=args.pretty, fp=output)
 
         elif args.mode == "crawl":
             if not args.url:
-                print("ERROR: crawl requiere URL", file=sys.stderr)
+                print("ERROR: crawl requires URL", file=sys.stderr)
                 sys.exit(1)
             results = crawl(args.url, fmt=args.format, depth=args.depth,
                             limit=args.limit, quiet=args.quiet, use_browser=args.browser)
             if output:
                 json.dump(results, output, ensure_ascii=False, indent=2 if args.pretty else None)
-                print(f"Guardado → {args.output} ({len(results)} páginas)")
+                print(f"Saved → {args.output} ({len(results)} pages)")
             else:
                 print(json.dumps(results, ensure_ascii=False, indent=2 if args.pretty else None))
 
         elif args.mode == "map":
             if not args.url:
-                print("ERROR: map requiere URL", file=sys.stderr)
+                print("ERROR: map requires URL", file=sys.stderr)
                 sys.exit(1)
             result = site_map(args.url, depth=args.depth, limit=args.limit)
             if output:
                 json.dump(result, output, ensure_ascii=False, indent=2 if args.pretty else None)
-                print(f"Guardado → {args.output}")
+                print(f"Saved → {args.output}")
             else:
                 print(json.dumps(result, ensure_ascii=False, indent=2 if args.pretty else None))
 
         elif args.mode == "xsearch":
-            query = args.url or input("Búsqueda en X: ")
+            query = args.url or input("Search on X: ")
             results = x_search(query, limit=args.limit)
             if output:
                 json.dump(results, output, ensure_ascii=False, indent=2)
-                print(f"Guardado → {args.output} ({len(results)} tweets)")
+                print(f"Saved → {args.output} ({len(results)} tweets)")
             elif args.quiet:
                 for t in results:
                     print(f"[{t.get('date','')[:10]}] @{t.get('user','')}: {t.get('content','')[:200]}")
@@ -481,12 +481,12 @@ Ejemplos:
                 print(json.dumps(results, ensure_ascii=False, indent=2 if args.pretty else None))
 
         elif args.mode == "xuser":
-            username = args.url or input("Usuario de X: ")
+            username = args.url or input("X username: ")
             username = username.lstrip("@")
             results = x_user(username, limit=args.limit)
             if output:
                 json.dump(results, output, ensure_ascii=False, indent=2)
-                print(f"Guardado → {args.output} ({len(results)} tweets)")
+                print(f"Saved → {args.output} ({len(results)} tweets)")
             elif args.quiet:
                 for t in results:
                     print(f"[{t.get('date','')[:10]}] {t.get('content','')[:200]}")
@@ -495,12 +495,12 @@ Ejemplos:
 
         elif args.mode == "linkedin":
             if not args.url:
-                print("ERROR: linkedin requiere URL del perfil", file=sys.stderr)
+                print("ERROR: linkedin requires profile URL", file=sys.stderr)
                 sys.exit(1)
             result = linkedin_profile(args.url)
             if output:
                 json.dump(result, output, ensure_ascii=False, indent=2)
-                print(f"Guardado → {args.output}")
+                print(f"Saved → {args.output}")
             else:
                 print(json.dumps(result, ensure_ascii=False, indent=2 if args.pretty else None))
 
@@ -521,7 +521,7 @@ def _emit(result: dict, quiet: bool = False, pretty: bool = False, fp=None):
         j = json.dumps(result, ensure_ascii=False, indent=2 if pretty else None)
         if fp:
             fp.write(j)
-            print(f"Guardado → {fp.name}")
+            print(f"Saved → {fp.name}")
         else:
             print(j)
 

@@ -1,21 +1,21 @@
 # Freecrawler 🔥
 
-**Alternativa 100% local, gratuita y sin límites a Firecrawl.**
+**100% local, free, and unlimited alternative to Firecrawl.**
 
-Freecrawler es un scraper todo-en-uno para AI agents. Extrae contenido web, genera JSON estructurado, busca en X/Twitter, y navega la web autónomamente — todo sin API keys, sin créditos, sin depender de servicios externos.
+Freecrawler is an all-in-one scraper for AI agents. It extracts web content, generates structured JSON, searches X/Twitter, and browses the web autonomously — no API keys, no credits, no external dependencies.
 
-Hecho por y para AI agents que necesitan scrapear sin que los cobren por página.
+Built by and for AI agents that need to scrape without being charged per page.
 
-## Características
+## Features
 
-### 🕷️ Scraping Web
-- **Modo scrape**: extrae contenido limpio de cualquier URL en Markdown, texto o JSON
-- **Modo crawl**: descubre y extrae múltiples páginas del mismo sitio con profundidad configurable
-- **Modo map**: construye un sitemap de todas las URLs internas
-- **JS rendering**: opcional con Playwright para SPAs y sitios con JavaScript pesado
+### 🕷️ Web Scraping
+- **Scrape mode**: extract clean content from any URL as Markdown, text, or JSON
+- **Crawl mode**: discover and extract multiple pages from the same site with configurable depth
+- **Map mode**: build a sitemap of all internal URLs
+- **JS rendering**: optional Playwright support for SPAs and heavy JavaScript sites
 
-### 📊 JSON Estructurado (sin LLM)
-Usa `crawl4ai` con schemas CSS para extraer datos estructurados sin necesidad de un modelo de lenguaje:
+### 📊 Structured JSON (no LLM required)
+Uses `crawl4ai` with CSS schemas to extract structured data without any language model:
 
 ```bash
 python freecrawler.py extract https://books.toscrape.com \
@@ -23,81 +23,81 @@ python freecrawler.py extract https://books.toscrape.com \
 ```
 
 ### 🐦 X/Twitter
-- Búsqueda de tweets por keywords
-- Extracción de timeline de usuarios  
-- Sin API key de X — usa twscrape con GraphQL
+- Search tweets by keywords
+- Extract user timelines
+- No X API key — uses twscrape with GraphQL
 
-### 🧭 Navegación Autónoma
-- browser-use integrado para tareas de navegación web autónoma
-- El agente IA decide qué hacer: buscar, hacer clic, llenar formularios, extraer datos
+### 🧭 Autonomous Browsing
+- Integrated browser-use for autonomous web navigation
+- The AI agent decides what to do: search, click, fill forms, extract data
 
-## Instalación
+## Installation
 
 ```bash
-# Requisitos básicos
+# Core requirements
 pip install requests beautifulsoup4 lxml trafilatura html2text markdownify
 
-# Para funcionalidad completa
-pip install crawl4ai twscrape playwright "browser-use[core]" --user
+# Full functionality
+pip install crawl4ai twscrape playwright "browser-use[core]"
 python -m playwright install chromium
 ```
 
-## Uso Rápido
+## Quick Start
 
 ```bash
-# Extraer una URL
-python freecrawler.py scrape https://ejemplo.com
+# Extract a URL
+python freecrawler.py scrape https://example.com
 
-# En texto plano
-python freecrawler.py scrape https://ejemplo.com --format text
+# Plain text
+python freecrawler.py scrape https://example.com --format text
 
 # Crawl
-python freecrawler.py crawl https://ejemplo.com --depth 2 --limit 20
+python freecrawler.py crawl https://example.com --depth 2 --limit 20
 
-# Mapa del sitio
-python freecrawler.py map https://ejemplo.com
+# Site map
+python freecrawler.py map https://example.com
 
-# JSON estructurado
+# Structured JSON
 python freecrawler.py extract https://books.toscrape.com \
   --schema "article.product_pod: h3 a=title .price_color=price"
 
-# Buscar en X
-python freecrawler.py xsearch "inteligencia artificial" --limit 10
+# Search X/Twitter
+python freecrawler.py xsearch "artificial intelligence" --limit 10
 
-# Tweets de un usuario
-python freecrawler.py xuser @usuario
+# User tweets
+python freecrawler.py xuser @username
 
-# Navegación autónoma
-python freecrawler.py browse "Busca el precio del bitcoin"
+# Autonomous browsing
+python freecrawler.py browse "Find the current price of bitcoin"
 ```
 
-## Comparativa con Firecrawl
+## Comparison with Firecrawl
 
-| Característica | Firecrawl | Freecrawler |
+| Feature | Firecrawl | Freecrawler |
 |---|---|---|
-| Costo | Por crédito/página | **Gratis** |
-| API Key | Requerida | **No necesita** |
-| JS Rendering | Automático | Con `--browser` |
+| Cost | Per credit/page | **Free** |
+| API Key | Required | **Not needed** |
+| JS Rendering | Automatic | With `--browser` |
 | Markdown output | ✅ | ✅ |
 | Crawl | ✅ | ✅ |
 | Map (sitemap) | ✅ | ✅ |
-| JSON estructurado | ✅ (con schema) | ✅ (con schema CSS) |
+| Structured JSON | ✅ (with schema) | ✅ (with CSS schema) |
 | X/Twitter scraping | ❌ | ✅ |
-| Navegación autónoma | ❌ | ✅ (browser-use) |
-| Límite de uso | Según plan | **Ilimitado** |
-| Dependencias | Servidor remoto | **100% local** |
-| Disponibilidad | Si el servicio cae, no | **Siempre funciona** |
+| Autonomous browsing | ❌ | ✅ (browser-use) |
+| Usage limits | Based on plan | **Unlimited** |
+| Dependencies | Remote server | **100% local** |
+| Availability | Service dependent | **Always works** |
 
-## Arquitectura
+## Architecture
 
-Freecrawler tiene 3 motores intercambiables:
+Freecrawler has 3 interchangeable engines:
 
-1. **HTTP Direct** (requests + trafilatura): rápido, para HTML estático
-2. **crawl4ai**: JS rendering, JSON extraction por schema CSS, crawling avanzado
-3. **browser-use**: navegación autónoma con IA
+1. **HTTP Direct** (requests + trafilatura): fast, for static HTML
+2. **crawl4ai**: JS rendering, JSON extraction via CSS schema, advanced crawling
+3. **browser-use**: AI-powered autonomous browsing
 
-Selecciona automáticamente el motor según el modo y flags.
+The engine is automatically selected based on the mode and flags.
 
-## Licencia
+## License
 
-MIT — haz lo que quieras.
+MIT — do whatever you want.
