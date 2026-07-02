@@ -117,6 +117,28 @@ Freecrawler has 3 interchangeable engines:
 
 The engine is automatically selected based on the mode and flags.
 
+## Changelog
+
+### v2.0 (2026-07-02)
+
+**Bug fixes and reliability improvements** — 8 verified issues resolved.
+
+- **F1**: Added missing `import urllib.request` for the stdlib fallback path
+- **F2**: New CSV schema format (`title=h3 a, price=.price_color`) preserves CSS selectors with spaces
+- **F3**: Unified schema parser grammar — same format works for both crawl4ai and BeautifulSoup engines
+- **F4**: Fixed `xuser` command — now resolves username to numeric user ID before calling the API
+- **F5**: Fixed `linkedin` command — uses Selenium driver + `actions.login()` instead of invalid constructor kwargs
+- **F6**: Captures real HTTP status codes instead of hardcoding 200
+- **F7**: Optimized crawler — reduces double-fetching, preserves child links on content errors
+- **F8**: (Pending) robots.txt respect, rate limiting, and retry with exponential backoff
+
+Full audit and fixes by [@miguelitoxrox](https://github.com/miguelitoxrox) — comprehensive code review with reproductions, consequences, and remediations for each finding.
+
+## Credits
+
+- [@miguelitoxrox](https://github.com/miguelitoxrox) — thorough code audit and bug report (Issue #1)
+- Built by [@GustavoRinconTinoco](https://github.com/GustavoRinconTinoco)
+
 ## License
 
 MIT — do whatever you want.

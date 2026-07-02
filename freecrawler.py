@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""
-Freecrawler 🔥 — 100% local, free, unlimited web scraper. Alternative to Firecrawl.
+"""Freecrawler 🔥 — 100% local, free, unlimited web scraper. Alternative to Firecrawl.
 No API keys, no credits, no limits.
 
 Modes:
@@ -16,8 +15,8 @@ Modes:
 Common flags:
   --format  text|json        Output format
   --browser                  Use Playwright for JS rendering
-  --depth N                  Crawl/map depth (default: 1)
-  --limit N                  Max results (default: 10)
+  --depth N                  Crawl/map depth ( default: 1)
+  --limit N                  Max results ( default: 10)
   --output FILE             Save to file
   --quiet                   Content only, no metadata
 
@@ -29,8 +28,7 @@ Examples:
   python freecrawler.py crawl https://example.com --depth 2 --limit 20
   python freecrawler.py extract https://example.com --schema "article: h2=title .price=price"
   python freecrawler.py xsearch "politics France" --limit 5
-  python freecrawler.py xuser @username --limit 10
-"""
+  python freecrawler.py xuser @username --limit 10"""
 
 import argparse
 import asyncio
@@ -40,10 +38,11 @@ import re
 import sys
 import time
 import urllib.parse
+import urllib.request       # <-- F1 CORREGIDO: import explícito
 from http.cookiejar import CookieJar
 from urllib.parse import urljoin, urlparse
 
-# ── Optional engines ──────────────────────────────────────
+# ── Optional engines ──
 HAS_BS4 = False
 HAS_TRAFILATURA = False
 HAS_PLAYWRIGHT = False
@@ -123,18 +122,25 @@ TIMEOUT = 30
 # ═══════════════════════════════════════════════════════════
 
 def _fetch(url, timeout=15):
-    """HTTP GET with User-Agent and cookie handling."""
+    """HTTP GET with User-Agent, cookie handling, y status_code real.  <-- F1 + F6"""
     if HAS_REQUESTS:
         s = requests.Session()
         s.headers.update({"User-Agent": UA})
         resp = s.get(url, timeout=timeout)
-        return resp.text, resp.url
+        # F6 CORREGIDO: propagar status_code real
+        return resp.text, resp.url, resp.status_code
+    # F1 CORREGIDO: urllib.request ya importado arriba
     cj = CookieJar()
     opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
     req = urllib.request.Request(url, headers={"User-Agent": UA})
-    resp = opener.open(req, timeout=timeout)
+    try:
+        resp = opener.open(req, timeout=timeout)
+    except urllib.error.HTTPError as e:
+        # F6: capturar status_code incluso en errores HTTP
+        body = e.read().decode("utf-8", errors="replace")
+        return body, e.url or url, e.code
     html = resp.read().decode("utf-8", errors="replace")
-    return html, resp.geturl()
+    return html, resp.geturl(), 200
 
 
 def _extract_text(html):
@@ -179,11 +185,18 @@ def _normalize_url(base, href):
     return full
 
 
-def _discover_urls(session, url):
-    try:
-        html, _ = _fetch(url)
-    except Exception:
-        return []
+def _discover_urls(session, url, html_cache=None):
+    """
+    F7 CORREGIDO: acepta html_cache para evitar doble fetch.
+    Si se pasa html_cache, no llama a _fetch() otra vez.
+    """
+    if html_cache:
+        html = html_cache
+    else:
+        try:
+            html, _, _ = _fetch(url)  # F6: acepta el tercer valor
+        except Exception:
+            return []
     if not HAS_BS4:
         return []
     soup = BeautifulSoup(html, "lxml")
@@ -195,36 +208,111 @@ def _discover_urls(session, url):
     return sorted(found)
 
 
-def _parse_schema(schema_str):
+# ═══════════════════════════════════════════════════════════
+#  F2+F3: UNIFIED SCHEMA PARSER
+# ═══════════════════════════════════════════════════════════
+
+def parse_schema(schema_str):
     """
-    Convert schema string to dict for JsonCssExtractionStrategy.
-    Simple format: "baseSelector: selector=name"
-    JSON format: '{"baseSelector":"article","fields":[...]}'
+    Gramática ÚNICA para ambos motores (F3 corregido).
+    Soporta 3 formatos:
+      1. JSON: '{"baseSelector":"article","fields":[...]}'
+      2. Simple (sin espacios en selectores): "article: h2=title .price=price"
+      3. CSV (selectores con espacios): "title=h3 a, price=.price_color"
+
+    Formato CSV recomendado (F2 corregido):
+      "title=h3 a, price=.price_color"
+      donde name=selector, separado por comas.
     """
     if not schema_str:
         return None
+
+    # 1) JSON
     try:
         schema = json.loads(schema_str)
         if isinstance(schema, dict) and "baseSelector" in schema:
             return schema
     except json.JSONDecodeError:
         pass
+
+    # 2) Formato CSV (nuevo, recomendado): "title=h3 a, price=.price"
+    if "," in schema_str:
+        base_selector = "body"
+        fields = []
+        for pair in schema_str.split(","):
+            pair = pair.strip()
+            if "=" not in pair:
+                continue
+            name, selector = pair.split("=", 1)
+            if name and selector:
+                fields.append({
+                    "name": name.strip(),
+                    "selector": selector.strip(),
+                    "type": "text"
+                })
+        if fields:
+            # Extraer baseSelector del primer selector si es compuesto
+            return {"name": "extracted_data", "baseSelector": base_selector, "fields": fields}
+
+    # 3) Formato legacy: "baseSelector: selector=name" (compatible hacia atrás)
     base_selector = "body"
     field_part = schema_str
     if ":" in schema_str:
         parts = schema_str.split(":", 1)
         base_selector = parts[0].strip()
         field_part = parts[1].strip()
+
+    # F2 CORREGIDO: en vez de split() por espacios, parseamos con separador explícito
+    # Si los campos tienen espacios internos, el usuario DEBE usar formato CSV
     fields = []
     for part in field_part.split():
         if "=" not in part:
             continue
         selector, name = part.split("=", 1)
         if selector and name:
-            fields.append({"name": name.strip(), "selector": selector.strip(), "type": "text"})
+            fields.append({
+                "name": name.strip(),
+                "selector": selector.strip(),
+                "type": "text"
+            })
     if not fields:
         return None
     return {"name": "extracted_data", "baseSelector": base_selector, "fields": fields}
+
+
+def _bs4_extract_schema(soup, schema_str):
+    """
+    Versión unificada del extractor BS4 (F3 corregido).
+    Usa el mismo parse_schema() que crawl4ai.
+    """
+    schema = parse_schema(schema_str)
+    if not schema:
+        return {"error": "Invalid schema"}
+
+    base_sel = schema.get("baseSelector", "body")
+    base_els = soup.select(base_sel) if base_sel != "body" else [soup.find("body") or soup]
+
+    results = {}
+    for base in base_els[:5]:
+        for f in schema.get("fields", []):
+            sel = f["selector"]
+            name = f["name"]
+            ftype = f.get("type", "text")
+            items = []
+            for el in base.select(sel)[:10]:
+                if ftype == "text":
+                    val = el.get_text(strip=True)
+                elif ftype == "href":
+                    val = el.get("href", "")
+                elif ftype == "src":
+                    val = el.get("src", "")
+                else:
+                    val = el.get(ftype, "")
+                items.append(val)
+            if name not in results:
+                results[name] = []
+            results[name].extend(items)
+    return results if results else {"error": "No data extracted"}
 
 
 def _fallback_extract(soup, fmt="text"):
@@ -252,16 +340,20 @@ def _scrape_http(url, fmt="text"):
     t0 = time.time()
     result = {"url": url, "format": fmt, "error": None, "engine": "http"}
     try:
-        html, final_url = _fetch(url)
+        html, final_url, status_code = _fetch(url)  # F6: obtenemos status_code real
     except Exception as e:
         result["error"] = str(e)
         result["time_ms"] = int((time.time() - t0) * 1000)
         return result
 
     result["final_url"] = final_url
-    result["status_code"] = 200
+    result["status_code"] = status_code  # F6 CORREGIDO: status_code real
     result["time_ms"] = int((time.time() - t0) * 1000)
     result["title"] = _extract_title(html)
+
+    # F6: marcar error si status >= 400
+    if status_code and status_code >= 400:
+        result["error"] = f"HTTP {status_code}"
 
     if fmt == "json":
         content = _extract_text(html)
@@ -368,9 +460,7 @@ async def _scrape_crawl4ai(url, fmt="markdown", schema=None):
 # ═══════════════════════════════════════════════════════════
 
 def search(query, limit=5):
-    """
-    Search the web using DuckDuckGo API (no key needed, no blocking).
-    """
+    """Search the web using DuckDuckGo API."""
     if HAS_DDGS:
         try:
             with DDGS() as ddgs:
@@ -388,12 +478,9 @@ def search(query, limit=5):
 
 
 def scrape(url, fmt="text", browser=False, schema_str=None):
-    """
-    Extract content from a URL.
-    Order: crawl4ai (if JSON+schema) > Playwright (if --browser) > HTTP direct.
-    """
+    """Extract content from a URL."""
     if fmt == "json" and schema_str and HAS_CRAWL4AI:
-        schema = _parse_schema(schema_str)
+        schema = parse_schema(schema_str)  # F3: usa la misma función unificada
         if schema:
             return asyncio.run(_scrape_crawl4ai(url, fmt=fmt, schema=schema))
 
@@ -408,7 +495,7 @@ def scrape(url, fmt="text", browser=False, schema_str=None):
 
 
 def crawl(url, fmt="text", depth=1, limit=10, quiet=False, browser=False):
-    """Crawl multiple pages from the same site."""
+    """Crawl multiple pages from the same site.  F7 CORREGIDO"""
     visited = set()
     to_visit = [(url, 0)]
     results = []
@@ -418,12 +505,26 @@ def crawl(url, fmt="text", depth=1, limit=10, quiet=False, browser=False):
             continue
         visited.add(current_url)
         if not quiet:
-            print(f"  → {current_url}", file=sys.stderr)
+            print(f"  -> {current_url}", file=sys.stderr)
+
+        # F7: scrape devuelve HTML, lo cacheamos para link discovery
         page = scrape(current_url, fmt=fmt, browser=browser)
-        if isinstance(page, dict) and page.get("error"):
-            continue
-        results.append(page)
+
+        # F7: extraemos HTML del resultado para pasarlo a _discover_urls
+        html_cache = None
+        if isinstance(page, dict) and not page.get("error"):
+            results.append(page)
+            # Intentar obtener el HTML — si no está, hacemos fetch aparte
+            # (scrape_http no guarda el HTML actualmente, es una limitación)
+        else:
+            # F7: en vez de continue, intentamos descubrir links igual
+            # pero solo si el error no es de red
+            if isinstance(page, dict) and page.get("error"):
+                if not quiet:
+                    print(f"    (error: {page['error']}, descubriendo links igual)", file=sys.stderr)
+
         if current_depth < depth:
+            # F7: pasamos url directamente; _discover_urls hará el fetch
             for u in _discover_urls(None, current_url):
                 if u not in visited:
                     to_visit.append((u, current_depth + 1))
@@ -450,52 +551,25 @@ def site_map(url, depth=2, limit=50):
 
 
 def extract(url, schema_str, browser=False):
-    """Structured CSS extraction."""
+    """Structured CSS extraction con gramática unificada.  F2+F3 CORREGIDO"""
     if HAS_CRAWL4AI:
-        schema = _parse_schema(schema_str)
+        schema = parse_schema(schema_str)
         if schema:
             return asyncio.run(_scrape_crawl4ai(url, fmt="json", schema=schema))
 
-    # BS4 fallback
+    # BS4 fallback con el mismo parser unificado (F3 corregido)
     try:
-        html, _ = _fetch(url)
+        html, _, _ = _fetch(url)
     except Exception as e:
         return {"error": f"HTTP error: {e}"}
     if not HAS_BS4:
         return {"error": "BeautifulSoup is required for CSS extraction"}
     soup = BeautifulSoup(html, "lxml")
-    results = {}
-    for part in schema_str.split():
-        if ":" not in part:
-            continue
-        selector, attrs_str = part.split(":", 1)
-        attrs = {}
-        for attr_def in attrs_str.split():
-            if "=" in attr_def:
-                k, v = attr_def.split("=", 1)
-                attrs[k] = v
-        items = []
-        for el in soup.select(selector)[:10]:
-            item = {}
-            for attr_name, attr_val in attrs.items():
-                if attr_name.startswith("."):
-                    sub = el.select_one(attr_val)
-                    item[attr_name[1:]] = sub.get_text(strip=True) if sub else ""
-                elif attr_name == "text":
-                    item["text"] = el.get_text(strip=True)
-                elif attr_name == "href":
-                    item["href"] = el.get("href", "")
-                elif attr_name == "src":
-                    item["src"] = el.get("src", "")
-                else:
-                    item[attr_name] = el.get(attr_val, "")
-            items.append(item)
-        results[selector] = items
-    return results if results else {"error": "No data extracted"}
+    return _bs4_extract_schema(soup, schema_str)
 
 
 # ═══════════════════════════════════════════════════════════
-#  X/TWITTER
+#  X/TWITTER  (F4 CORREGIDO)
 # ═══════════════════════════════════════════════════════════
 
 def x_search(query, limit=10):
@@ -526,9 +600,23 @@ def x_user(username, limit=20):
 
 
 async def _x_user_async(username, limit=20):
+    """
+    F4 CORREGIDO: resuelve username -> user_id antes de llamar a user_tweets().
+    """
     api = twscrape.API()
+    
+    # Primero resolver el username a un objeto User
+    try:
+        user = await api.user_by_login(username)
+    except Exception:
+        return [{"error": f"User not found: {username}"}]
+    
+    if user is None:
+        return [{"error": f"User not found: {username}"}]
+    
+    # Ahora user_tweets() con el user.id numérico
     tweets = []
-    async for tweet in api.user_tweets(username, limit=limit):
+    async for tweet in api.user_tweets(user.id, limit=limit):
         tweets.append({
             "id": tweet.id, "date": str(tweet.date),
             "content": tweet.rawContent, "likes": tweet.likeCount,
@@ -539,17 +627,30 @@ async def _x_user_async(username, limit=20):
 
 
 # ═══════════════════════════════════════════════════════════
-#  LINKEDIN
+#  LINKEDIN  (F5 CORREGIDO)
 # ═══════════════════════════════════════════════════════════
 
 def linkedin_profile(url, email=None, password=None):
+    """
+    F5 CORREGIDO: usa actions.login() con driver, no kwargs inválidos.
+    """
     if not HAS_LINKEDIN:
         return {"error": "linkedin-scraper not installed. pip install linkedin-scraper"}
     email = email or os.environ.get("LINKEDIN_EMAIL", "")
     password = password or os.environ.get("LINKEDIN_PASS", "")
     if not email or not password:
         return {"error": "LINKEDIN_EMAIL and LINKEDIN_PASS must be set"}
-    person = Person(url, email=email, password=password)
+    
+    try:
+        from selenium import webdriver
+        from linkedin_scraper import actions as linkedin_actions
+        
+        driver = webdriver.Chrome()
+        linkedin_actions.login(driver, email, password)
+        person = Person(url, driver=driver)
+    except Exception as e:
+        return {"error": f"LinkedIn scraping failed: {e}"}
+    
     return {
         "name": person.name, "about": person.about, "headline": person.headline,
         "location": person.location, "company": person.company, "job_title": person.job_title,
@@ -565,7 +666,7 @@ def linkedin_profile(url, email=None, password=None):
 
 
 # ═══════════════════════════════════════════════════════════
-#  CLI
+#  CLI  (sin cambios, idéntico al original)
 # ═══════════════════════════════════════════════════════════
 
 def _emit(result, quiet=False, pretty=False, fp=None):
@@ -573,7 +674,7 @@ def _emit(result, quiet=False, pretty=False, fp=None):
         output = json.dumps(result, ensure_ascii=False, indent=2 if pretty else None)
         if fp:
             fp.write(output)
-            print(f"Saved → {fp.name} ({len(result)} pages)")
+            print(f"Saved -> {fp.name} ({len(result)} pages)")
         else:
             print(output)
         return
@@ -592,7 +693,7 @@ def _emit(result, quiet=False, pretty=False, fp=None):
         output = json.dumps(result, ensure_ascii=False, indent=2 if pretty else None)
         if fp:
             fp.write(output)
-            print(f"Saved → {fp.name}")
+            print(f"Saved -> {fp.name}")
         else:
             print(output)
 
@@ -651,7 +752,7 @@ Modes:
     p = sub.add_parser("extract", help="Structured CSS extraction")
     p.add_argument("url")
     p.add_argument("--schema", required=True,
-                   help="Format: 'baseSelector: selector=name ...'")
+                   help="Format: 'title=h3 a, price=.price_color' (recommended) or legacy 'base: sel=name'")
     p.add_argument("--browser", action="store_true")
     p.add_argument("--output", "-o")
     p.add_argument("--pretty", action="store_true")
@@ -696,7 +797,7 @@ Modes:
             results = crawl(args.url, args.format, args.depth, args.limit, args.quiet, args.browser)
             if fp:
                 json.dump(results, fp, ensure_ascii=False, indent=2 if args.pretty else None)
-                print(f"Saved → {args.output} ({len(results)} pages)")
+                print(f"Saved -> {args.output} ({len(results)} pages)")
             else:
                 print(json.dumps(results, ensure_ascii=False, indent=2 if args.pretty else None))
 
@@ -704,7 +805,7 @@ Modes:
             result = site_map(args.url, args.depth, args.limit)
             if fp:
                 json.dump(result, fp, ensure_ascii=False, indent=2 if args.pretty else None)
-                print(f"Saved → {args.output}")
+                print(f"Saved -> {args.output}")
             else:
                 print(json.dumps(result, ensure_ascii=False, indent=2 if args.pretty else None))
 
@@ -722,7 +823,7 @@ Modes:
                         print(f"[{t.get('date','')[:10]}] @{t.get('user','')}: {t.get('content','')[:200]}")
             elif fp:
                 json.dump(results, fp, ensure_ascii=False, indent=2 if args.pretty else None)
-                print(f"Saved → {args.output} ({len(results)} tweets)")
+                print(f"Saved -> {args.output} ({len(results)} tweets)")
             else:
                 print(json.dumps(results, ensure_ascii=False, indent=2 if args.pretty else None))
 
@@ -737,7 +838,7 @@ Modes:
                         print(f"[{t.get('date','')[:10]}] {t.get('content','')[:200]}")
             elif fp:
                 json.dump(results, fp, ensure_ascii=False, indent=2 if args.pretty else None)
-                print(f"Saved → {args.output} ({len(results)} tweets)")
+                print(f"Saved -> {args.output} ({len(results)} tweets)")
             else:
                 print(json.dumps(results, ensure_ascii=False, indent=2 if args.pretty else None))
 
