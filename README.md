@@ -119,6 +119,26 @@ The engine is automatically selected based on the mode and flags.
 
 ## Changelog
 
+### v2.1 (2026-07-02)
+
+**Performance, safety, and compatibility improvements** — fused with improvements from community review.
+
+- **F2**: Enhanced schema parser — now auto-detects CSV format (`name=selector, name=selector`) vs legacy whitespace format (`selector=name selector=name`). Both work, no breaking changes.
+- **F6**: Added `urllib.error.HTTPError` handling in stdlib fallback — no crash on 4xx/5xx when `requests` is absent.
+- **F7**: Shared HTTP session across crawl requests (connection reuse) + `_html` internal cache (no more double-fetch).
+- **F8**: Added `--delay` parameter (default 0.5s) and binary extension filter (PDF, images, zips, etc. are skipped before fetching).
+- **LinkedIn**: Added `driver.quit()` in `finally` block — no more orphaned Chrome processes. Added ToS warning.
+- **Playwright**: Added `finally` block to ensure browser closes even on error.
+- **Internal**: Added `_clean()` to strip internal keys before output.
+
+Feedback and improvements by Agabilan — code review and practical enhancements for robustness.
+
+## Credits
+
+- [@miguelitoxrox](https://github.com/miguelitoxrox) — thorough code audit and bug report (Issue #1)
+- Agabilan — code review, performance improvements, and robustness enhancements
+- Built by [@GustavoRinconTinoco](https://github.com/GustavoRinconTinoco)
+
 ### v2.0 (2026-07-02)
 
 **Bug fixes and reliability improvements** — 8 verified issues resolved.
@@ -137,6 +157,7 @@ Full audit and fixes by [@miguelitoxrox](https://github.com/miguelitoxrox) — c
 ## Credits
 
 - [@miguelitoxrox](https://github.com/miguelitoxrox) — thorough code audit and bug report (Issue #1)
+- Agabilan — code review, performance improvements, and robustness enhancements
 - Built by [@GustavoRinconTinoco](https://github.com/GustavoRinconTinoco)
 
 ## License
