@@ -131,12 +131,12 @@ The engine is automatically selected based on the mode and flags.
 - **Playwright**: Added `finally` block to ensure browser closes even on error.
 - **Internal**: Added `_clean()` to strip internal keys before output.
 
-Feedback and improvements by Agabilan — code review and practical enhancements for robustness.
+Feedback and improvements by Gabilan — code review and practical enhancements for robustness.
 
 ## Credits
 
 - [@miguelitoxrox](https://github.com/miguelitoxrox) — thorough code audit and bug report (Issue #1)
-- Agabilan — code review, performance improvements, and robustness enhancements
+- Gabilan — code review, performance improvements, and robustness enhancements
 - Built by [@GustavoRinconTinoco](https://github.com/GustavoRinconTinoco)
 
 ### v2.0 (2026-07-02)
@@ -157,7 +157,7 @@ Full audit and fixes by [@miguelitoxrox](https://github.com/miguelitoxrox) — c
 ## Credits
 
 - [@miguelitoxrox](https://github.com/miguelitoxrox) — thorough code audit and bug report (Issue #1)
-- Agabilan — code review, performance improvements, and robustness enhancements
+- Gabilan — code review, performance improvements, and robustness enhancements
 - Built by [@GustavoRinconTinoco](https://github.com/GustavoRinconTinoco)
 
 ## License
