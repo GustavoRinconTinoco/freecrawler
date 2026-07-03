@@ -825,9 +825,9 @@ def _emit(result, quiet=False, pretty=False, fp=None, item_label="items", quiet_
     xsearch/xuser) and dict results (scrape/extract/map/linkedin) the same way,
     so main() doesn't need to duplicate the save/print logic per command."""
     if isinstance(result, list):
-        if quiet and quiet_fn:
+        if quiet:
             for item in result:
-                print(quiet_fn(item))
+                print(_dump(item, pretty=False))
             return
         output = _dump(result, pretty)
         if fp:
