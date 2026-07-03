@@ -47,8 +47,8 @@ import re
 import sys
 import time
 import urllib.parse
-import urllib.request  # FIX F1: was used in _fetch() fallback but never imported
-import urllib.error    # FIX F6 v2.1: for HTTPError handling in stdlib fallback
+import urllib.request
+import urllib.error
 from http.cookiejar import CookieJar
 from urllib.parse import urljoin, urlparse
 
@@ -113,19 +113,23 @@ except ImportError:
     pass
 
 try:
-    from duckduckgo_search import DDGS
+    from ddgs import DDGS
     HAS_DDGS = True
 except ImportError:
     try:
-        from ddgs import DDGS
+        from duckduckgo_search import DDGS
         HAS_DDGS = True
     except ImportError:
         pass
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
-TIMEOUT = 30
+TIMEOUT = 30  # single source of truth for network timeouts (seconds)
 
-# Extensions we should never try to parse as HTML (FIX F8)
+# Concurrency caps for parallel crawl/map (keeps us polite + avoids exhausting sockets)
+CRAWL_CONCURRENCY = 8
+MAP_CONCURRENCY = 8
+
+# Extensions we should never try to parse as HTML
 BINARY_EXTENSIONS = (
     ".pdf", ".zip", ".rar", ".7z", ".gz", ".tar", ".exe", ".dmg",
     ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".ico",
@@ -138,12 +142,25 @@ BINARY_EXTENSIONS = (
 # BASE UTILITIES
 # ═══════════════════════════════════════════════════════════
 
-def _fetch(url, timeout=15, session=None):
+def _describe_fetch_error(e):
+    """Turn a raw exception into a short, useful error string."""
+    if HAS_REQUESTS:
+        if isinstance(e, requests.exceptions.Timeout):
+            return f"Timeout after {TIMEOUT}s"
+        if isinstance(e, requests.exceptions.ConnectionError):
+            return f"Connection error: {e}"
+        if isinstance(e, requests.exceptions.RequestException):
+            return f"Request error: {e}"
+    if isinstance(e, urllib.error.URLError):
+        return f"URL error: {getattr(e, 'reason', e)}"
+    return str(e)
+
+
+def _fetch(url, timeout=TIMEOUT, session=None):
     """HTTP GET with User-Agent and cookie handling.
 
-    Returns (html, final_url, status_code).
-    FIX F6: status_code is now the real HTTP status instead of a hardcoded 200.
-    FIX F7: optionally reuses a requests.Session for connection keep-alive.
+    Returns (html, final_url, status_code) with a real HTTP status code,
+    even on HTTP error responses (4xx/5xx) or urllib HTTPError.
     """
     if HAS_REQUESTS:
         s = session or requests.Session()
@@ -157,15 +174,21 @@ def _fetch(url, timeout=15, session=None):
     try:
         resp = opener.open(req, timeout=timeout)
     except urllib.error.HTTPError as e:
-        # FIX F6 v2.1: capture status_code even on HTTP errors
         body = e.read().decode("utf-8", errors="replace")
         return body, e.url or url, e.code
     html = resp.read().decode("utf-8", errors="replace")
     return html, resp.geturl(), resp.getcode()
 
 
+async def _fetch_async(url, timeout=TIMEOUT, session=None):
+    """Non-blocking wrapper around _fetch() using the default thread executor,
+    so multiple pages can be fetched concurrently without adding dependencies."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _fetch, url, timeout, session)
+
+
 def _is_probably_binary(url):
-    """FIX F8: skip known binary/non-HTML extensions before fetching/parsing."""
+    """Skip known binary/non-HTML extensions before fetching/parsing."""
     path = urlparse(url).path.lower()
     return path.endswith(BINARY_EXTENSIONS)
 
@@ -213,7 +236,7 @@ def _normalize_url(base, href):
 
 
 def _discover_urls_from_html(base_url, html):
-    """FIX F7: parse links out of HTML we already fetched, instead of re-fetching."""
+    """Parse links out of HTML we already fetched, instead of re-fetching."""
     if not HAS_BS4:
         return []
     soup = BeautifulSoup(html, "lxml")
@@ -230,10 +253,10 @@ def _parse_schema(schema_str):
     Convert schema string to a normalized dict:
       {"baseSelector": "...", "fields": [{"name": ..., "selector": ..., "type": "text"}, ...]}
 
-    Grammar (single source of truth — FIX F3, used by every engine):
+    Grammar (single source of truth, used by every engine):
       "baseSelector: name=selector, name2=selector2"
     Fields are comma-separated so selectors may contain spaces
-    (FIX F2 — "h3 a" no longer gets mangled by whitespace splitting).
+    (descendant selectors like "h3 a" are supported).
 
     A raw JSON schema (crawl4ai's native format) is also accepted as-is.
     """
@@ -256,10 +279,8 @@ def _parse_schema(schema_str):
 
     fields = []
 
-    # FIX F2 v2.1: comma-based CSV format "name=selector, name2=selector2"
-    # vs legacy whitespace format "selector=name selector2=name2"
     if "," in field_part:
-        # New CSV format: name=selector, name=selector
+        # CSV format: name=selector, name=selector
         for chunk in field_part.split(","):
             chunk = chunk.strip()
             if not chunk or "=" not in chunk:
@@ -304,23 +325,26 @@ def _fallback_extract(soup, fmt="text"):
     return "\n".join(l for l in text.split("\n") if l.strip())
 
 
-def _scrape_http(url, fmt="text", session=None):
-    """HTTP direct engine (fast, no JS). Returns dict; also stashes raw html
-    under result['_html'] so callers (crawl) can reuse it instead of re-fetching (FIX F7)."""
+def _scrape_http_full(url, fmt="text", session=None):
+    """HTTP direct engine (fast, no JS).
+
+    Returns (result_dict, html_or_None). The raw HTML is returned as a
+    separate value instead of being stashed inside the result dict, so
+    callers never need to strip an internal key before emitting output.
+    """
     t0 = time.time()
     result = {"url": url, "format": fmt, "error": None, "engine": "http"}
     try:
         html, final_url, status_code = _fetch(url, session=session)
     except Exception as e:
-        result["error"] = str(e)
+        result["error"] = _describe_fetch_error(e)
         result["time_ms"] = int((time.time() - t0) * 1000)
-        return result
+        return result, None
 
     result["final_url"] = final_url
-    result["status_code"] = status_code  # FIX F6
+    result["status_code"] = status_code
     result["time_ms"] = int((time.time() - t0) * 1000)
     result["title"] = _extract_title(html)
-    result["_html"] = html  # internal use, stripped before final output
 
     if status_code >= 400:
         result["error"] = f"HTTP {status_code}"
@@ -344,11 +368,16 @@ def _scrape_http(url, fmt="text", session=None):
         result["content"] = (content or "[No content]").strip()
 
     result["content_length"] = len(result["content"])
+    return result, html
+
+
+def _scrape_http(url, fmt="text", session=None):
+    result, _html = _scrape_http_full(url, fmt=fmt, session=session)
     return result
 
 
-def _scrape_playwright(url, fmt="text"):
-    """Playwright engine (JS rendering)."""
+def _scrape_playwright_full(url, fmt="text"):
+    """Playwright engine (JS rendering). Returns (result_dict, html_or_None)."""
     t0 = time.time()
     result = {"url": url, "format": fmt, "error": None, "engine": "playwright"}
     browser = None
@@ -356,7 +385,7 @@ def _scrape_playwright(url, fmt="text"):
         with sync_playwright() as pw:
             browser = pw.chromium.launch(headless=True)
             page = browser.new_page()
-            page.goto(url, wait_until="networkidle", timeout=30000)
+            page.goto(url, wait_until="networkidle", timeout=TIMEOUT * 1000)
             try:
                 accept_btn = page.query_selector(
                     'button:has-text("Accept"), button:has-text("I Accept"), '
@@ -377,7 +406,7 @@ def _scrape_playwright(url, fmt="text"):
     except Exception as e:
         result["error"] = f"Playwright error: {e}"
         result["time_ms"] = int((time.time() - t0) * 1000)
-        return result
+        return result, None
     finally:
         if browser:
             try:
@@ -391,8 +420,22 @@ def _scrape_playwright(url, fmt="text"):
     content = _extract_text(html)
     result["content"] = (content[:15000] if content else "[No content]").strip()
     result["content_length"] = len(result["content"])
-    result["_html"] = html
+    return result, html
+
+
+def _scrape_playwright(url, fmt="text"):
+    result, _html = _scrape_playwright_full(url, fmt=fmt)
     return result
+
+
+async def _scrape_http_full_async(url, fmt="text", session=None):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _scrape_http_full, url, fmt, session)
+
+
+async def _scrape_playwright_full_async(url, fmt="text"):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _scrape_playwright_full, url, fmt)
 
 
 async def _scrape_crawl4ai(url, fmt="markdown", schema=None):
@@ -410,7 +453,7 @@ async def _scrape_crawl4ai(url, fmt="markdown", schema=None):
 
     try:
         async with AsyncWebCrawler() as crawler:
-            crawl_result = await crawler.arun(url, config=config)
+            crawl_result = await asyncio.wait_for(crawler.arun(url, config=config), timeout=TIMEOUT * 2)
     except Exception as e:
         result["error"] = str(e)
         result["time_ms"] = int((time.time() - t0) * 1000)
@@ -437,22 +480,44 @@ async def _scrape_crawl4ai(url, fmt="markdown", schema=None):
 # MAIN MODES
 # ═══════════════════════════════════════════════════════════
 
+_SEARCH_CACHE = {}
+_SEARCH_CACHE_MAX = 128
+
+
 def search(query, limit=5):
-    """Search the web using DuckDuckGo API (no key needed, no blocking)."""
-    if HAS_DDGS:
-        try:
-            with DDGS() as ddgs:
-                results = []
-                for r in ddgs.text(query, max_results=limit):
-                    results.append({
-                        "title": r.get("title", ""),
-                        "url": r.get("href", ""),
-                        "description": r.get("body", ""),
-                    })
-                return results if results else [{"error": "No results found"}]
-        except Exception as e:
-            return [{"error": f"DDGS search failed: {e}"}]
-    return [{"error": "DuckDuckGo Search library not installed. pip install duckduckgo_search"}]
+    """Search the web using DuckDuckGo API (no key needed, no blocking).
+
+    Repeated identical (query, limit) calls are served from a small
+    in-memory cache instead of hitting the network again.
+    """
+    cache_key = (query, limit)
+    cached = _SEARCH_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    if not HAS_DDGS:
+        return [{"error": "DuckDuckGo Search library not installed. pip install duckduckgo_search"}]
+
+    try:
+        with DDGS() as ddgs:
+            results = []
+            for r in ddgs.text(query, max_results=limit):
+                results.append({
+                    "title": r.get("title", ""),
+                    "url": r.get("href", ""),
+                    "description": r.get("body", ""),
+                })
+    except Exception as e:
+        return [{"error": f"DDGS search failed: {e}"}]
+
+    results = results if results else [{"error": "No results found"}]
+
+    if not any("error" in r for r in results):
+        if len(_SEARCH_CACHE) >= _SEARCH_CACHE_MAX:
+            _SEARCH_CACHE.pop(next(iter(_SEARCH_CACHE)))
+        _SEARCH_CACHE[cache_key] = results
+
+    return results
 
 
 def scrape(url, fmt="text", browser=False, schema_str=None, session=None):
@@ -475,83 +540,134 @@ def scrape(url, fmt="text", browser=False, schema_str=None, session=None):
     return _scrape_http(url, fmt=fmt, session=session)
 
 
+async def _crawl_async(url, fmt="text", depth=1, limit=10, quiet=False, browser=False, delay=0.5):
+    session = requests.Session() if HAS_REQUESTS else None
+    visited = set()
+    results = []
+    current_level = [url]
+    current_depth = 0
+    sem = asyncio.Semaphore(min(CRAWL_CONCURRENCY, max(1, limit)))
+
+    async def fetch_one(u):
+        async with sem:
+            res, html = (None, None)
+            if browser:
+                if HAS_PLAYWRIGHT:
+                    res, html = await _scrape_playwright_full_async(u, fmt=fmt)
+                    if res.get("error"):
+                        res, html = await _scrape_http_full_async(u, fmt=fmt, session=session)
+                else:
+                    res, html = ({"url": u, "error": "Browser mode requires Playwright."}, None)
+            else:
+                res, html = await _scrape_http_full_async(u, fmt=fmt, session=session)
+            return u, res, html
+
+    while current_level and len(results) < limit:
+        candidates = list(dict.fromkeys(
+            u for u in current_level if u not in visited and not _is_probably_binary(u)
+        ))
+        remaining = limit - len(results)
+        batch = candidates[:remaining] if remaining > 0 else []
+        if not batch:
+            break
+        for u in batch:
+            visited.add(u)
+
+        if not quiet:
+            for u in batch:
+                print(f"  → {u}", file=sys.stderr)
+
+        batch_results = await asyncio.gather(*(fetch_one(u) for u in batch), return_exceptions=True)
+
+        next_level = []
+        for item in batch_results:
+            if isinstance(item, Exception) or item is None:
+                continue
+            u, res, html = item
+            if res.get("error") and not html:
+                continue
+            results.append(res)
+            if current_depth < depth and html:
+                for link in _discover_urls_from_html(u, html):
+                    if link not in visited:
+                        next_level.append(link)
+            if len(results) >= limit:
+                break
+
+        current_level = next_level
+        current_depth += 1
+        if current_level and delay:
+            await asyncio.sleep(delay)
+
+    return results[:limit]
+
+
 def crawl(url, fmt="text", depth=1, limit=10, quiet=False, browser=False, delay=0.5):
     """Crawl multiple pages from the same site.
 
-    FIX F7: fetches each page once (reuses the already-downloaded HTML to discover
-    links instead of re-fetching), reuses a single HTTP session for keep-alive, and
-    still enqueues links even when content extraction (but not the fetch) had issues.
-    FIX F8: skips known binary URLs and waits `delay` seconds between requests.
+    Pages within the same BFS level are fetched concurrently (bounded by
+    CRAWL_CONCURRENCY) instead of one at a time, while still respecting
+    `depth`, `limit` and a politeness `delay` between levels.
     """
+    return asyncio.run(_crawl_async(url, fmt, depth, limit, quiet, browser, delay))
+
+
+async def _site_map_async(url, depth=2, limit=50, delay=0.5):
     session = requests.Session() if HAS_REQUESTS else None
     visited = set()
-    to_visit = [(url, 0)]
-    results = []
-
-    while to_visit and len(results) < limit:
-        current_url, current_depth = to_visit.pop(0)
-        if current_url in visited or _is_probably_binary(current_url):
-            continue
-        visited.add(current_url)
-
-        if not quiet:
-            print(f"  → {current_url}", file=sys.stderr)
-
-        page = scrape(current_url, fmt=fmt, browser=browser, session=session)
-        html = page.pop("_html", None) if isinstance(page, dict) else None
-
-        if isinstance(page, dict) and page.get("error") and not html:
-            # total fetch failure: nothing to extract, nothing to discover links from
-            time.sleep(delay)
-            continue
-
-        results.append(page)
-
-        if current_depth < depth and html:
-            for u in _discover_urls_from_html(current_url, html):
-                if u not in visited:
-                    to_visit.append((u, current_depth + 1))
-
-        time.sleep(delay)  # FIX F8: basic politeness delay
-
-    return results
-
-
-def site_map(url, depth=2, limit=50, delay=0.5):
-    """Build a sitemap of internal URLs."""
-    session = requests.Session() if HAS_REQUESTS else None
-    visited = set()
-    to_visit = [(url, 0)]
     tree = {url: []}
+    current_level = [url]
+    current_depth = 0
+    sem = asyncio.Semaphore(min(MAP_CONCURRENCY, max(1, limit)))
 
-    while to_visit and len(visited) < limit:
-        current_url, current_depth = to_visit.pop(0)
-        if current_url in visited or _is_probably_binary(current_url):
-            continue
-        visited.add(current_url)
+    async def fetch_links(u):
+        async with sem:
+            try:
+                html, _final_url, _status = await _fetch_async(u, session=session)
+            except Exception:
+                return u, []
+            return u, _discover_urls_from_html(u, html)
 
-        try:
-            html, _final_url, _status = _fetch(current_url, session=session)
-        except Exception:
-            tree[current_url] = []
-            continue
+    while current_level and len(visited) < limit:
+        candidates = list(dict.fromkeys(
+            u for u in current_level if u not in visited and not _is_probably_binary(u)
+        ))
+        remaining = limit - len(visited)
+        batch = candidates[:remaining] if remaining > 0 else []
+        if not batch:
+            break
+        for u in batch:
+            visited.add(u)
 
-        discovered = _discover_urls_from_html(current_url, html)
-        tree[current_url] = discovered
+        batch_results = await asyncio.gather(*(fetch_links(u) for u in batch), return_exceptions=True)
 
-        if current_depth < depth:
-            for u in discovered:
-                if u not in visited:
-                    to_visit.append((u, current_depth + 1))
+        next_level = []
+        for item in batch_results:
+            if isinstance(item, Exception) or item is None:
+                continue
+            u, discovered = item
+            tree[u] = discovered
+            if current_depth < depth:
+                for d in discovered:
+                    if d not in visited:
+                        next_level.append(d)
 
-        time.sleep(delay)
+        current_level = next_level
+        current_depth += 1
+        if current_level and delay:
+            await asyncio.sleep(delay)
 
     return {"root": url, "total_urls": len(visited), "urls": sorted(visited), "tree": tree}
 
 
+def site_map(url, depth=2, limit=50, delay=0.5):
+    """Build a sitemap of internal URLs (parallelized per BFS level)."""
+    return asyncio.run(_site_map_async(url, depth, limit, delay))
+
+
 def _extract_with_schema(soup, schema):
-    """Shared extraction logic used by both the crawl4ai path and the bs4 fallback,
-    so both honor the exact same schema grammar (FIX F3)."""
+    """Shared extraction logic used by both the crawl4ai path and the bs4
+    fallback, so both honor the exact same schema grammar."""
     base_selector = schema.get("baseSelector", "body")
     fields = schema.get("fields", [])
     items = []
@@ -566,7 +682,7 @@ def _extract_with_schema(soup, schema):
 
 def extract(url, schema_str, browser=False):
     """Structured CSS extraction. Uses the same schema grammar regardless of
-    which engine is available (FIX F3)."""
+    which engine is available."""
     schema = _parse_schema(schema_str)
     if not schema:
         return {"error": "Could not parse --schema. Expected format: 'baseSelector: name=selector, name2=selector2'"}
@@ -577,7 +693,7 @@ def extract(url, schema_str, browser=False):
     try:
         html, _final_url, status_code = _fetch(url)
     except Exception as e:
-        return {"error": f"HTTP error: {e}"}
+        return {"error": f"HTTP error: {_describe_fetch_error(e)}"}
     if status_code >= 400:
         return {"error": f"HTTP {status_code}"}
     if not HAS_BS4:
@@ -601,16 +717,19 @@ def x_search(query, limit=10):
 async def _x_search_async(query, limit=10):
     api = twscrape.API()
     tweets = []
-    async for tweet in api.search(query, limit=limit):
-        tweets.append({
-            "id": tweet.id, "date": str(tweet.date),
-            "user": tweet.user.username if tweet.user else "unknown",
-            "fullname": tweet.user.displayname if tweet.user else "",
-            "content": tweet.rawContent, "likes": tweet.likeCount,
-            "retweets": tweet.retweetCount, "replies": tweet.replyCount,
-            "url": tweet.url,
-        })
-    return tweets
+    try:
+        async for tweet in api.search(query, limit=limit):
+            tweets.append({
+                "id": tweet.id, "date": str(tweet.date),
+                "user": tweet.user.username if tweet.user else "unknown",
+                "fullname": tweet.user.displayname if tweet.user else "",
+                "content": tweet.rawContent, "likes": tweet.likeCount,
+                "retweets": tweet.retweetCount, "replies": tweet.replyCount,
+                "url": tweet.url,
+            })
+    except Exception as e:
+        return [{"error": f"X search failed: {e}"}]
+    return tweets if tweets else [{"error": "No tweets found"}]
 
 
 def x_user(username, limit=20):
@@ -620,22 +739,25 @@ def x_user(username, limit=20):
 
 
 async def _x_user_async(username, limit=20):
-    """FIX F4: twscrape's user_tweets() expects a numeric user id, not a handle.
+    """twscrape's user_tweets() expects a numeric user id, not a handle.
     Resolve the handle to an id first via user_by_login()."""
     api = twscrape.API()
-    user = await api.user_by_login(username)
-    if user is None:
-        return [{"error": f"User not found: {username}"}]
+    try:
+        user = await api.user_by_login(username)
+        if user is None:
+            return [{"error": f"User not found: {username}"}]
 
-    tweets = []
-    async for tweet in api.user_tweets(user.id, limit=limit):
-        tweets.append({
-            "id": tweet.id, "date": str(tweet.date),
-            "content": tweet.rawContent, "likes": tweet.likeCount,
-            "retweets": tweet.retweetCount, "replies": tweet.replyCount,
-            "url": tweet.url,
-        })
-    return tweets
+        tweets = []
+        async for tweet in api.user_tweets(user.id, limit=limit):
+            tweets.append({
+                "id": tweet.id, "date": str(tweet.date),
+                "content": tweet.rawContent, "likes": tweet.likeCount,
+                "retweets": tweet.retweetCount, "replies": tweet.replyCount,
+                "url": tweet.url,
+            })
+    except Exception as e:
+        return [{"error": f"X user lookup failed: {e}"}]
+    return tweets if tweets else [{"error": "No tweets found"}]
 
 
 # ═══════════════════════════════════════════════════════════
@@ -643,9 +765,9 @@ async def _x_user_async(username, limit=20):
 # ═══════════════════════════════════════════════════════════
 
 def linkedin_profile(url, email=None, password=None):
-    """FIX F5: linkedin-scraper's Person does not accept email/password kwargs.
-    It needs an authenticated Selenium driver. This also requires `selenium` and
-    a Chromedriver to be installed and on PATH.
+    """linkedin-scraper's Person does not accept email/password kwargs.
+    It needs an authenticated Selenium driver. This also requires `selenium`
+    and a Chromedriver to be installed and on PATH.
 
     NOTE: scraping LinkedIn with automated credentials is against LinkedIn's
     Terms of Service and can get the account suspended. Use at your own risk.
@@ -663,8 +785,9 @@ def linkedin_profile(url, email=None, password=None):
     except ImportError:
         return {"error": "selenium not installed. pip install selenium (and a matching chromedriver)"}
 
-    driver = webdriver.Chrome()
+    driver = None
     try:
+        driver = webdriver.Chrome()
         li_actions.login(driver, email, password)
         person = Person(url, driver=driver, close_on_complete=False)
         return {
@@ -679,33 +802,37 @@ def linkedin_profile(url, email=None, password=None):
                 for e in (person.educations or [])
             ],
         }
+    except Exception as e:
+        return {"error": f"LinkedIn scraping failed: {e}"}
     finally:
-        driver.quit()
+        if driver:
+            try:
+                driver.quit()
+            except Exception:
+                pass
 
 
 # ═══════════════════════════════════════════════════════════
 # CLI
 # ═══════════════════════════════════════════════════════════
 
-def _clean(result):
-    """Strip internal-only keys (like the cached html) before we print/save."""
-    if isinstance(result, dict):
-        result.pop("_html", None)
-    elif isinstance(result, list):
-        for r in result:
-            if isinstance(r, dict):
-                r.pop("_html", None)
-    return result
+def _dump(data, pretty):
+    return json.dumps(data, ensure_ascii=False, indent=2 if pretty else None)
 
 
-def _emit(result, quiet=False, pretty=False, fp=None):
-    result = _clean(result)
-
+def _emit(result, quiet=False, pretty=False, fp=None, item_label="items", quiet_fn=None):
+    """Unified output for every command: handles list results (search/crawl/
+    xsearch/xuser) and dict results (scrape/extract/map/linkedin) the same way,
+    so main() doesn't need to duplicate the save/print logic per command."""
     if isinstance(result, list):
-        output = json.dumps(result, ensure_ascii=False, indent=2 if pretty else None)
+        if quiet and quiet_fn:
+            for item in result:
+                print(quiet_fn(item))
+            return
+        output = _dump(result, pretty)
         if fp:
             fp.write(output)
-            print(f"Saved → {fp.name} ({len(result)} pages)")
+            print(f"Saved → {fp.name} ({len(result)} {item_label})")
         else:
             print(output)
         return
@@ -717,13 +844,13 @@ def _emit(result, quiet=False, pretty=False, fp=None):
     if quiet:
         content = result.get("data") or result.get("content", "")
         if isinstance(content, (dict, list)):
-            content = json.dumps(content, ensure_ascii=False, indent=2 if pretty else None)
+            content = _dump(content, pretty)
         if fp:
             fp.write(content)
         else:
             print(content)
     else:
-        output = json.dumps(result, ensure_ascii=False, indent=2 if pretty else None)
+        output = _dump(result, pretty)
         if fp:
             fp.write(output)
             print(f"Saved → {fp.name}")
@@ -820,11 +947,9 @@ Schema grammar for --schema:
     try:
         if args.command == "search":
             results = search(args.query, args.limit)
-            if args.quiet:
-                for r in results:
-                    print(r.get("error", r.get("url", str(r))))
-            else:
-                print(json.dumps(results, ensure_ascii=False, indent=2 if args.pretty else None))
+            quiet_fn = lambda r: r.get("error", r.get("url", str(r)))
+            _emit(results, quiet=args.quiet, pretty=args.pretty, fp=fp,
+                  item_label="results", quiet_fn=quiet_fn)
 
         elif args.command == "scrape":
             result = scrape(args.url, args.format, args.browser, getattr(args, "schema", None))
@@ -832,20 +957,13 @@ Schema grammar for --schema:
 
         elif args.command == "crawl":
             results = crawl(args.url, args.format, args.depth, args.limit, args.quiet, args.browser, args.delay)
-            results = _clean(results)
-            if fp:
-                json.dump(results, fp, ensure_ascii=False, indent=2 if args.pretty else None)
-                print(f"Saved → {args.output} ({len(results)} pages)")
-            else:
-                print(json.dumps(results, ensure_ascii=False, indent=2 if args.pretty else None))
+            # crawl's --quiet only silences progress messages during the crawl
+            # itself (handled above); the final output is always the full list.
+            _emit(results, quiet=False, pretty=args.pretty, fp=fp, item_label="pages")
 
         elif args.command == "map":
             result = site_map(args.url, args.depth, args.limit, args.delay)
-            if fp:
-                json.dump(result, fp, ensure_ascii=False, indent=2 if args.pretty else None)
-                print(f"Saved → {args.output}")
-            else:
-                print(json.dumps(result, ensure_ascii=False, indent=2 if args.pretty else None))
+            _emit(result, quiet=False, pretty=args.pretty, fp=fp)
 
         elif args.command == "extract":
             result = extract(args.url, args.schema, getattr(args, "browser", False))
@@ -853,32 +971,16 @@ Schema grammar for --schema:
 
         elif args.command == "xsearch":
             results = x_search(args.query, args.limit)
-            if args.quiet:
-                for t in results:
-                    if t.get("error"):
-                        print(t["error"])
-                    else:
-                        print(f"[{t.get('date','')[:10]}] @{t.get('user','')}: {t.get('content','')[:200]}")
-            elif fp:
-                json.dump(results, fp, ensure_ascii=False, indent=2 if args.pretty else None)
-                print(f"Saved → {args.output} ({len(results)} tweets)")
-            else:
-                print(json.dumps(results, ensure_ascii=False, indent=2 if args.pretty else None))
+            quiet_fn = lambda t: t.get("error") or f"[{t.get('date','')[:10]}] @{t.get('user','')}: {t.get('content','')[:200]}"
+            _emit(results, quiet=args.quiet, pretty=args.pretty, fp=fp,
+                  item_label="tweets", quiet_fn=quiet_fn)
 
         elif args.command == "xuser":
             username = args.username.lstrip("@")
             results = x_user(username, args.limit)
-            if args.quiet:
-                for t in results:
-                    if t.get("error"):
-                        print(t["error"])
-                    else:
-                        print(f"[{t.get('date','')[:10]}] {t.get('content','')[:200]}")
-            elif fp:
-                json.dump(results, fp, ensure_ascii=False, indent=2 if args.pretty else None)
-                print(f"Saved → {args.output} ({len(results)} tweets)")
-            else:
-                print(json.dumps(results, ensure_ascii=False, indent=2 if args.pretty else None))
+            quiet_fn = lambda t: t.get("error") or f"[{t.get('date','')[:10]}] {t.get('content','')[:200]}"
+            _emit(results, quiet=args.quiet, pretty=args.pretty, fp=fp,
+                  item_label="tweets", quiet_fn=quiet_fn)
 
         elif args.command == "linkedin":
             result = linkedin_profile(args.url)
