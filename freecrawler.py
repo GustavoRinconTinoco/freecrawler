@@ -41,10 +41,12 @@ Examples:
 
 import argparse
 import asyncio
+import base64
 import json
 import os
 import re
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -62,6 +64,13 @@ HAS_LINKEDIN = False
 HAS_REQUESTS = False
 HAS_HTML2TEXT = False
 HAS_DDGS = False
+HAS_WEBSOCKET = False
+
+try:
+    import websocket
+    HAS_WEBSOCKET = True
+except ImportError:
+    pass
 
 try:
     import requests
@@ -813,6 +822,807 @@ def linkedin_profile(url, email=None, password=None):
 
 
 # ═══════════════════════════════════════════════════════════
+# CDP BROWSER — connect to Chrome DevTools on localhost:9222
+# ═══════════════════════════════════════════════════════════
+
+class CDPBrowser:
+    """Control Chrome via DevTools Protocol (CDP) on ws://localhost:9222."""
+
+    def __init__(self, cdp_port=9222):
+        self.cdp_http = f"http://localhost:{cdp_port}"
+        self.ws = None
+        self.target_id = None
+        self._msg_id = 0
+        self._responses = {}
+        self._lock = threading.Lock()
+        self._events = []
+        self._listener_alive = False
+        self._targets_cache = []
+
+    # ── Discovery ──────────────────────────────────────────
+
+    def _get_json(self, path):
+        resp = urllib.request.urlopen(f"{self.cdp_http}{path}", timeout=5)
+        return json.loads(resp.read())
+
+    def list_targets(self):
+        self._targets_cache = self._get_json("/json")
+        return self._targets_cache
+
+    def _new_tab(self, url="about:blank"):
+        """Create new tab via Target.createTarget CDP command."""
+        # Get browser WebSocket URL from version endpoint
+        ver = self._get_json("/json/version")
+        browser_ws = ver.get("webSocketDebuggerUrl")
+        if browser_ws:
+            try:
+                temp_ws = websocket.create_connection(browser_ws, timeout=5,
+                                                      suppress_origin=True)
+                cmd = json.dumps({"id": 1, "method": "Target.createTarget",
+                                  "params": {"url": url}})
+                temp_ws.send(cmd)
+                resp = json.loads(temp_ws.recv())
+                temp_ws.close()
+                if "result" in resp:
+                    return {"id": resp["result"]["targetId"],
+                            "webSocketDebuggerUrl": f"{self.cdp_http}/devtools/page/{resp['result']['targetId']}"}
+            except Exception:
+                pass
+        # Fallback: HTTP /json/new endpoint
+        params = json.dumps({"url": url}).encode()
+        req = urllib.request.Request(
+            f"{self.cdp_http}/json/new", data=params,
+            headers={"Content-Type": "application/json"}
+        )
+        resp = urllib.request.urlopen(req, timeout=5)
+        return json.loads(resp.read())
+
+    # ── Connection ────────────────────────────────────────
+
+    def connect(self, target_id=None):
+        """Open WebSocket to a tab. Creates a new one if none given."""
+        targets = self.list_targets()
+        ws_url = None
+        if target_id:
+            for t in targets:
+                if t["id"] == target_id:
+                    ws_url = t["webSocketDebuggerUrl"]
+                    break
+        if not ws_url:
+            for t in targets:
+                ws_url = t["webSocketDebuggerUrl"]
+                target_id = t["id"]
+                break
+        if not ws_url:
+            tab = self._new_tab()
+            ws_url = tab["webSocketDebuggerUrl"]
+            target_id = tab["id"]
+
+        self.target_id = target_id
+        self.ws = websocket.create_connection(ws_url, timeout=10,
+                                              suppress_origin=True)
+        self._listener_alive = True
+        t = threading.Thread(target=self._listener, daemon=True)
+        t.start()
+        # Enable domains
+        time.sleep(0.1)  # brief settling for listener thread
+        self.call("Page.enable", timeout=5)
+        self.call("Runtime.enable", timeout=5)
+        return target_id
+
+    def _listener(self):
+        while self._listener_alive:
+            try:
+                msg = json.loads(self.ws.recv())
+                mid = msg.get("id")
+                if mid is not None:
+                    with self._lock:
+                        self._responses[mid] = msg
+                elif msg.get("method"):
+                    self._events.append(msg)
+            except Exception:
+                self._listener_alive = False
+                break
+
+    # ── CDP Commands ──────────────────────────────────────
+
+    def send(self, method, params=None):
+        """Send a CDP command, return the request id (thread-safe)."""
+        if params is None:
+            params = {}
+        with self._lock:
+            self._msg_id += 1
+            mid = self._msg_id
+        try:
+            self.ws.send(json.dumps({"id": mid, "method": method, "params": params}))
+        except websocket.WebSocketConnectionClosedException:
+            self._listener_alive = False
+            return None
+        return mid
+
+    def call(self, method, params=None, timeout=30):
+        """Send a command and wait for the response."""
+        mid = self.send(method, params)
+        if mid is None:
+            return {"error": {"message": "WebSocket closed on send", "code": -32001,
+                              "data": "Cannot send command"}}
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if not self._listener_alive and self.ws:
+                return {"error": {"message": "WebSocket closed", "code": -32001,
+                                  "data": "Listener thread died"}}
+            with self._lock:
+                if mid in self._responses:
+                    return self._responses.pop(mid)
+            time.sleep(0.05)
+        return {"error": {"message": f"Timeout after {timeout}s", "code": -32000}}
+
+    def eval(self, expression):
+        """Evaluate JavaScript in the page context."""
+        return self.call("Runtime.evaluate", {
+            "expression": expression,
+            "returnByValue": True,
+            "awaitPromise": True,
+        })
+
+    def navigate(self, url):
+        return self.call("Page.navigate", {"url": url})
+
+    def go_back(self):
+        return self.call("Page.goBack")
+
+    def go_forward(self):
+        return self.call("Page.goForward")
+
+    def screenshot(self, fmt="png"):
+        result = self.call("Page.captureScreenshot", {"format": fmt})
+        if "result" in result and "data" in result["result"]:
+            return result["result"]["data"]
+        return None
+
+    def get_url(self):
+        r = self.call("Page.getNavigationHistory")
+        try:
+            idx = r["result"]["currentIndex"]
+            return r["result"]["entries"][idx]["url"]
+        except Exception:
+            return ""
+
+    def get_title(self):
+        r = self.eval("document.title")
+        try:
+            val = r["result"]["result"]["value"]
+            return val if val else ""
+        except Exception:
+            exc = r.get("result", {}).get("exceptionDetails", {})
+            if exc:
+                return f"[CDP Error: {exc.get('text', str(exc))}]"
+            return ""
+
+    def get_page_text(self):
+        r = self.eval("document.body ? document.body.innerText.substring(0, 15000) : ''")
+        try:
+            val = r["result"]["result"]["value"]
+            return val if val else ""
+        except Exception:
+            exc = r.get("result", {}).get("exceptionDetails", {})
+            if exc:
+                return f"[CDP Error: {exc.get('text', str(exc))}]"
+            return ""
+
+    def get_links(self):
+        r = self.eval("Array.from(document.querySelectorAll('a[href]')).map(a => ({href: a.href, text: a.textContent.trim().substring(0, 80)}))")
+        try:
+            val = r["result"]["result"]["value"]
+            return val if val else []
+        except Exception:
+            exc = r.get("result", {}).get("exceptionDetails", {})
+            if exc:
+                return [{"error": f"CDP Error: {exc.get('text', str(exc))}"}]
+            return []
+
+    # ── Interaction ───────────────────────────────────────
+
+    def _get_element_rect(self, selector):
+        """Get center coordinates of an element via JS."""
+        expr = json.dumps(selector)
+        r = self.eval(f"""
+            (() => {{
+                const el = document.querySelector({expr});
+                if (!el) return null;
+                const r = el.getBoundingClientRect();
+                return {{x: r.x + r.width/2, y: r.y + r.height/2,
+                         w: r.width, h: r.height, tag: el.tagName,
+                         visible: r.width > 0 && r.height > 0}};
+            }})()
+        """)
+        try:
+            return r["result"]["result"]["value"]
+        except Exception:
+            return None
+
+    def click(self, selector):
+        """Click an element by CSS selector."""
+        pos = self._get_element_rect(selector)
+        if not pos:
+            return {"error": f"Element '{selector}' not found"}
+        self.call("Input.dispatchMouseEvent", {
+            "type": "mousePressed", "x": pos["x"], "y": pos["y"],
+            "button": "left", "clickCount": 1
+        })
+        self.call("Input.dispatchMouseEvent", {
+            "type": "mouseReleased", "x": pos["x"], "y": pos["y"],
+            "button": "left", "clickCount": 1
+        })
+        time.sleep(0.3)
+        return {"success": True, "tag": pos.get("tag", ""), "pos": f"{pos['x']:.0f},{pos['y']:.0f}"}
+
+    def type_text(self, selector, text):
+        """Focus an element, clear it, type text via Input.insertText."""
+        pos = self._get_element_rect(selector)
+        if not pos:
+            return {"error": f"Element '{selector}' not found"}
+        # Click it first to focus
+        self.click(selector)
+        time.sleep(0.15)
+        # Clear via JS
+        self.eval(f"document.querySelector({json.dumps(selector)}).value = ''")
+        time.sleep(0.1)
+        # Insert text in one shot (faster, no synthetic key events)
+        self.call("Input.insertText", {"text": text})
+        return {"success": True, "length": len(text)}
+
+    def press_key(self, key):
+        """Press a raw key (Enter, Tab, Escape, etc.)."""
+        key_map = {
+            "enter": "Enter", "tab": "Tab", "esc": "Escape",
+            "escape": "Escape", "backspace": "Backspace",
+            "up": "ArrowUp", "down": "ArrowDown", "left": "ArrowLeft",
+            "right": "ArrowRight", "delete": "Delete",
+        }
+        k = key_map.get(key.lower(), key)
+        self.call("Input.dispatchKeyEvent", {"type": "rawKeyDown", "key": k})
+        self.call("Input.dispatchKeyEvent", {"type": "keyUp", "key": k})
+        return {"success": True}
+
+    def scroll(self, amount=600):
+        self.eval(f"window.scrollBy(0, {amount})")
+        time.sleep(0.3)
+        return {"success": True}
+
+    def scroll_up(self, amount=600):
+        self.eval(f"window.scrollBy(0, -{amount})")
+        time.sleep(0.3)
+        return {"success": True}
+
+    def switch_tab(self, target_id):
+        self.close()
+        return self.connect(target_id)
+
+    def close(self):
+        self._listener_alive = False
+        if self.ws:
+            try:
+                self.ws.close()
+            except Exception:
+                pass
+            self.ws = None
+
+    def _wait_for_page_load(self, timeout=15):
+        """Wait for document.readyState == 'complete'. Returns True if loaded."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if not self._listener_alive:
+                return False
+            r = self.eval("document.readyState")
+            try:
+                state = r["result"]["result"]["value"]
+                if state == "complete":
+                    return True
+            except Exception:
+                pass
+            time.sleep(0.2)
+        return False
+
+    def snapshot(self):
+        """Return a text summary of the page."""
+        lines = []
+        lines.append(f"URL:  {self.get_url()}")
+        lines.append(f"Title: {self.get_title()}")
+        lines.append("─" * 50)
+        text = self.get_page_text()
+        if text:
+            lines.append(text[:8000])
+        else:
+            links = self.get_links()
+            if links:
+                lines.append("Links found:")
+                for l in links[:30]:
+                    t = l.get("text", "") or "[no text]"
+                    lines.append(f"  {t[:60]} → {l['href'][:80]}")
+            else:
+                lines.append("[Empty page]")
+        return "\n".join(lines)
+
+    # ── REPL ──────────────────────────────────────────────
+
+    def repl(self):
+        """Interactive browse session."""
+        print("\n🔥 Freecrawler CDP Browser — connected. Commands:")
+        print("  goto <url>  |  click <selector>  |  type <sel> <text>")
+        print("  back | forward | scroll | scroll-up | press <key>")
+        print("  snap | ss (screenshot) | text | links | source | url | title")
+        print("  tabs | switch <id> | new <url>  |  eval <js>")
+        print("  help | exit\n")
+
+        while True:
+            try:
+                cmd = input("browse> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                break
+
+            if not cmd:
+                continue
+
+            parts = cmd.split(maxsplit=1)
+            action = parts[0].lower()
+            arg = parts[1] if len(parts) > 1 else ""
+
+            if action in ("exit", "quit", "q"):
+                print("Bye.")
+                break
+
+            elif action == "help":
+                print("  goto <url>      Navigate to URL")
+                print("  click <sel>     Click element by CSS selector")
+                print("  type <sel> txt  Type text into element")
+                print("  press <key>     Key: enter, tab, esc, backspace, up/down/left/right")
+                print("  back            Go back in history")
+                print("  forward         Go forward in history")
+                print("  scroll          Scroll down 600px")
+                print("  scroll-up       Scroll up 600px")
+                print("  snap            Page text snapshot")
+                print("  ss              Take screenshot (saves to file)")
+                print("  text            Get page text")
+                print("  links           List all links on page")
+                print("  source          Get page HTML")
+                print("  url             Show current URL")
+                print("  title           Show page title")
+                print("  tabs            List all Chrome tabs")
+                print("  switch <id>     Switch to another tab (first 8 chars of id)")
+                print("  new <url>       Open a new tab")
+                print("  eval <js>       Run JavaScript and show result")
+                print("  exit            Exit browse mode")
+
+            elif action == "goto":
+                url = arg if arg else input("URL: ").strip()
+                if not url.startswith("http"):
+                    url = "https://" + url
+                print(f" Navigating to {url}...")
+                self.navigate(url)
+                if not self._wait_for_page_load():
+                    print("  ⚠ Page load timeout, continuing anyway...")
+                print(f" Title: {self.get_title()}")
+                print(f" URL:   {self.get_url()}")
+
+            elif action == "click":
+                sel = arg if arg else input("Selector: ").strip()
+                print(f" Clicking '{sel}'...")
+                r = self.click(sel)
+                if "error" in r:
+                    print(f" ✗ {r['error']}")
+                else:
+                    print(f" ✓ Clicked {r['tag']} at {r['pos']}")
+                    time.sleep(0.5)
+                    print(f" Title: {self.get_title()}")
+
+            elif action == "type":
+                if not arg:
+                    sel = input("Selector: ").strip()
+                    txt = input("Text: ")
+                else:
+                    parts2 = cmd.split(maxsplit=2)
+                    if len(parts2) >= 3:
+                        sel = parts2[1]
+                        txt = parts2[2]
+                    else:
+                        sel = parts2[1] if len(parts2) > 1 else ""
+                        txt = input("Text: ")
+                print(f" Typing into '{sel}'...")
+                r = self.type_text(sel, txt)
+                if "error" in r:
+                    print(f" ✗ {r['error']}")
+                else:
+                    print(f" ✓ Typed {r['length']} chars")
+
+            elif action == "press":
+                key = arg or input("Key: ").strip()
+                r = self.press_key(key)
+                if "error" in r:
+                    print(f" ✗ {r['error']}")
+                else:
+                    print(f" ✓ Pressed {key}")
+
+            elif action == "back":
+                self.go_back()
+                time.sleep(1)
+                print(f" Title: {self.get_title()}")
+                print(f" URL:   {self.get_url()}")
+
+            elif action == "forward":
+                self.go_forward()
+                time.sleep(1)
+                print(f" Title: {self.get_title()}")
+                print(f" URL:   {self.get_url()}")
+
+            elif action == "scroll":
+                self.scroll()
+                print(" ✓ Scrolled down")
+
+            elif action in ("scroll-up", "scrollup"):
+                self.scroll_up()
+                print(" ✓ Scrolled up")
+
+            elif action == "snap":
+                print(self.snapshot())
+
+            elif action == "ss":
+                data = self.screenshot()
+                if data:
+                    from datetime import datetime
+                    ss_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "screenshots")
+                    os.makedirs(ss_dir, exist_ok=True)
+                    fname = os.path.join(ss_dir, f"fc_ss_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
+                    with open(fname, "wb") as f:
+                        f.write(base64.b64decode(data))
+                    print(f" ✓ Screenshot saved → {fname}")
+                else:
+                    print(" ✗ Screenshot failed")
+
+            elif action == "text":
+                text = self.get_page_text()
+                print(text[:5000] if text else "[No text]")
+
+            elif action == "links":
+                links = self.get_links()
+                if links:
+                    for i, l in enumerate(links[:40], 1):
+                        t = l.get("text", "") or "[no text]"
+                        print(f"  {i:2d}. {t[:60]}")
+                        print(f"       {l['href'][:80]}")
+                else:
+                    print(" No links found")
+
+            elif action == "source":
+                r = self.eval("document.documentElement.outerHTML")
+                try:
+                    html = r["result"]["result"]["value"]
+                    print(html[:5000])
+                except Exception:
+                    print(" Failed to get source")
+
+            elif action == "url":
+                print(self.get_url())
+
+            elif action == "title":
+                print(self.get_title())
+
+            elif action == "tabs":
+                targets = self.list_targets()
+                print(f"\n {len(targets)} tabs open:")
+                for t in targets:
+                    tid = t["id"][:8]
+                    title = (t.get("title") or "")[:60]
+                    url = (t.get("url") or "")[:60]
+                    active = "◉" if t["id"] == self.target_id else "○"
+                    print(f"  {active} [{tid}] {title or url}")
+                print()
+
+            elif action == "switch":
+                tid = arg.strip()
+                targets = self.list_targets()
+                found = None
+                for t in targets:
+                    if t["id"].startswith(tid):
+                        found = t["id"]
+                        break
+                if found:
+                    print(f" Switching to tab {tid}...")
+                    self.switch_tab(found)
+                    print(f" Title: {self.get_title()}")
+                else:
+                    print(f" No tab matching '{tid}'")
+                    print(" Use 'tabs' to see available tabs")
+
+            elif action == "new":
+                url = arg if arg else "about:blank"
+                if not url.startswith("http") and url != "about:blank":
+                    url = "https://" + url
+                tab = self._new_tab(url)
+                tid = tab["id"][:8]
+                print(f" ✓ New tab [{tid}]: {url}")
+
+            elif action == "eval":
+                js = arg if arg else input("JS: ").strip()
+                r = self.eval(js)
+                try:
+                    val = r["result"]["result"]
+                    print(json.dumps(val, indent=2, ensure_ascii=False)[:2000])
+                except Exception as e:
+                    print(json.dumps(r, indent=2, ensure_ascii=False)[:2000])
+
+            else:
+                # Try as URL shorthand
+                if "." in action or action.startswith("http"):
+                    url = action if action.startswith("http") else "https://" + action
+                    print(f" Navigating to {url}...")
+                    self.navigate(url)
+                    if not self._wait_for_page_load():
+                        print("  ⚠ Page load timeout, continuing anyway...")
+                    print(f" Title: {self.get_title()}")
+                else:
+                    print(f" Unknown command: {action}  (try 'help')")
+
+
+# ═══════════════════════════════════════════════════════════
+# Login automation (CDP)
+# ═══════════════════════════════════════════════════════════
+
+CREDS_DIR = os.environ.get(
+    "FREECRAWLER_CREDS_DIR",
+    os.path.join(os.path.expanduser("~"), ".hermes", "profiles", "morpheus", "creds"),
+)
+
+_USER_FIELD_JS = """
+(() => {
+    const sels = [
+        'input[type=email]',
+        'input[autocomplete=username]',
+        'input[name*=email i]', 'input[id*=email i]',
+        'input[name*=user i]', 'input[id*=user i]',
+        'input[name*=login i]', 'input[id*=login i]',
+        'input[type=text]'
+    ];
+    for (const s of sels) {
+        const els = Array.from(document.querySelectorAll(s));
+        const el = els.find(e => {
+            const r = e.getBoundingClientRect();
+            return r.width > 0 && r.height > 0 && !e.disabled;
+        });
+        if (el) {
+            el.setAttribute('data-fc-user', '1');
+            return s;
+        }
+    }
+    return null;
+})()
+"""
+
+_PASS_FIELD_JS = """
+(() => {
+    const els = Array.from(document.querySelectorAll('input[type=password]'));
+    const el = els.find(e => {
+        const r = e.getBoundingClientRect();
+        return r.width > 0 && r.height > 0 && !e.disabled;
+    });
+    if (el) {
+        el.setAttribute('data-fc-pass', '1');
+        return true;
+    }
+    return false;
+})()
+"""
+
+_SUBMIT_JS = """
+(() => {
+    const texts = ['se connecter','connexion','log in','login','sign in',
+                   'iniciar','entrar','continuer','continue','next','suivant','submit',
+                   'connexion','s\'identifier'];
+    const btns = Array.from(document.querySelectorAll(
+        'button[type=submit], input[type=submit], button, div[role=button]'));
+    const vis = btns.filter(b => {
+        const r = b.getBoundingClientRect();
+        return r.width > 0 && r.height > 0 && !b.disabled && !b.closest('[hidden]');
+    });
+    // 1. Explicit submit buttons
+    let el = vis.find(b => b.type === 'submit');
+    // 2. Match by text
+    if (!el) {
+        el = vis.find(b => {
+            const t = ((b.innerText || b.value || b.getAttribute('aria-label') || '') +
+                       ' ' + (b.querySelector('span')?.innerText || '')).toLowerCase().trim();
+            return texts.some(x => t.includes(x));
+        });
+    }
+    // 3. Last-resort: any visible button that's not a cancel/back link
+    if (!el) {
+        const skip = ['forgot','cancel','back','create','register','sign up','s\'inscrire',
+                      'phone','google','apple','facebook','microsoft'];
+        el = vis.find(b => {
+            const t = ((b.innerText || b.value || b.getAttribute('aria-label') || '') +
+                       ' ' + (b.querySelector('span')?.innerText || '')).toLowerCase().trim();
+            if (!t) return false;   // skip truly empty buttons
+            return !skip.some(x => t.includes(x));
+        });
+    }
+    if (el) {
+        el.setAttribute('data-fc-submit', '1');
+        return true;
+    }
+    return false;
+})()
+"""
+
+
+def load_creds(name):
+    """Load {username/email, password} from a creds JSON file by site name."""
+    path = os.path.join(CREDS_DIR, f"{name}.json")
+    if not os.path.exists(path):
+        available = []
+        if os.path.isdir(CREDS_DIR):
+            available = [f[:-5] for f in os.listdir(CREDS_DIR) if f.endswith(".json")]
+        return {"error": f"No creds file '{name}.json' in {CREDS_DIR}",
+                "available": available}
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    user = data.get("username") or data.get("email") or data.get("user")
+    password = data.get("password") or data.get("pass")
+    if not user or not password:
+        return {"error": f"'{name}.json' missing username/email or password"}
+    return {"user": user, "password": password}
+
+
+def _eval_value(browser, js):
+    """Run JS and return the raw value (or None)."""
+    r = browser.eval(js)
+    try:
+        res = r["result"]["result"]
+        if "exceptionDetails" in r.get("result", {}):
+            return None
+        return res.get("value")
+    except Exception:
+        return None
+
+
+def cdp_login(url, user, password, cdp_port=9222,
+              user_sel=None, pass_sel=None, submit_sel=None, timeout=25):
+    """Non-interactive login via CDP. Auto-detects fields; supports
+    two-step flows (email -> continue -> password). Returns a result dict."""
+    browser = CDPBrowser(cdp_port=cdp_port)
+    try:
+        browser.connect()
+    except Exception as e:
+        return {"error": f"CDP connect failed: {e}. Chrome on :{cdp_port}?"}
+
+    steps = []
+    try:
+        browser.navigate(url)
+        browser._wait_for_page_load(timeout=timeout)
+        time.sleep(1.0)
+        start_url = _eval_value(browser, "location.href") or url
+
+        # ── Step 1: user/email field ──
+        sel = user_sel
+        if not sel:
+            found = _eval_value(browser, _USER_FIELD_JS)
+            sel = "[data-fc-user='1']" if found else None
+        if sel:
+            r = browser.type_text(sel, user)
+            steps.append({"fill_user": r})
+        else:
+            steps.append({"fill_user": {"skipped": "no user field visible"}})
+
+        # ── Password on same page? ──
+        has_pass = bool(pass_sel) or bool(_eval_value(browser, _PASS_FIELD_JS))
+
+        if not has_pass:
+            # Two-step flow: submit email first, wait for password page
+            if _eval_value(browser, _SUBMIT_JS):
+                browser.click("[data-fc-submit='1']")
+                steps.append({"submit_email_step": True})
+            else:
+                browser.press_key("enter")
+                steps.append({"submit_email_step": "enter_key"})
+            time.sleep(2.5)
+            browser._wait_for_page_load(timeout=10)
+            has_pass = bool(_eval_value(browser, _PASS_FIELD_JS))
+
+        # ── Step 2: password ──
+        if has_pass:
+            psel = pass_sel or "[data-fc-pass='1']"
+            if not pass_sel:
+                _eval_value(browser, _PASS_FIELD_JS)  # re-tag after nav
+            r = browser.type_text(psel, password)
+            steps.append({"fill_password": r})
+        else:
+            return {"error": "No password field found (captcha? unknown flow?)",
+                    "url": _eval_value(browser, "location.href"), "steps": steps}
+
+        # ── Submit ──
+        ssel = submit_sel
+        if not ssel:
+            ssel = "[data-fc-submit='1']" if _eval_value(browser, _SUBMIT_JS) else None
+        if ssel:
+            browser.click(ssel)
+            steps.append({"submit": True})
+        else:
+            browser.press_key("enter")
+            steps.append({"submit": "enter_key"})
+
+        time.sleep(3.0)
+        browser._wait_for_page_load(timeout=timeout)
+        time.sleep(1.0)
+
+        # ── Verify ──
+        end_url = _eval_value(browser, "location.href")
+        still_pass = bool(_eval_value(
+            browser,
+            "!!Array.from(document.querySelectorAll('input[type=password]'))"
+            ".find(e => e.getBoundingClientRect().width > 0)"))
+        error_text = _eval_value(browser, """
+            (() => {
+                const sels = ['[class*=error i]','[id*=error i]','[role=alert]'];
+                for (const s of sels) {
+                    const el = document.querySelector(s);
+                    if (el && el.innerText.trim()) return el.innerText.trim().slice(0, 200);
+                }
+                return null;
+            })()
+        """)
+
+        success = (not still_pass) and (end_url != start_url or not error_text)
+        return {
+            "success": success,
+            "url": end_url,
+            "title": browser.get_title(),
+            "password_field_still_visible": still_pass,
+            "error_message_on_page": error_text,
+            "steps": steps,
+        }
+    finally:
+        browser.close()
+
+
+def browse_mode(target_id=None, cdp_port=9222, start_url=None):
+    """Entry point for the browse subcommand."""
+    if not HAS_WEBSOCKET:
+        print("Error: websocket-client not installed.")
+        print("Install: pip install websocket-client")
+        sys.exit(1)
+
+    browser = CDPBrowser(cdp_port=cdp_port)
+
+    print(f"🔍 Connecting to Chrome on ws://localhost:{cdp_port}...")
+    try:
+        browser.connect(target_id)
+        print(f"✓ Connected to tab: {browser.get_title() or browser.target_id[:8]}")
+    except Exception as e:
+        print(f"✗ Connection failed: {e}")
+        print("  Make sure Chrome is running with --remote-debugging-port=9222")
+        sys.exit(1)
+
+    # Auto-navigate if URL was provided as CLI argument
+    if start_url:
+        url = start_url if start_url.startswith("http") else "https://" + start_url
+        print(f"→ Navigating to {url}...")
+        browser.navigate(url)
+        loaded = browser._wait_for_page_load()
+        if not loaded:
+            print("  ⚠ Page load timeout, continuing anyway...")
+        else:
+            try:
+                print(f"  Title: {browser.get_title()}")
+            except Exception:
+                print("  (page loaded, title unavailable)")
+
+    try:
+        browser.repl()
+    finally:
+        browser.close()
+
+
+# ═══════════════════════════════════════════════════════════
 # CLI
 # ═══════════════════════════════════════════════════════════
 
@@ -941,6 +1751,22 @@ Schema grammar for --schema:
     p.add_argument("--output", "-o")
     p.add_argument("--pretty", action="store_true")
 
+    p = sub.add_parser("browse", help="Interactive CDP browser (requires Chrome on :9222)")
+    p.add_argument("url", nargs="?", help="URL to open (optional)")
+    p.add_argument("--tab", help="Target tab ID (partial match)")
+    p.add_argument("--port", type=int, default=9222, help="CDP port (default: 9222)")
+
+    p = sub.add_parser("login", help="Automated login via CDP (auto-detects fields)")
+    p.add_argument("url", help="Login page URL")
+    p.add_argument("--creds", help="Creds file name (e.g. 'wttj' -> creds/wttj.json)")
+    p.add_argument("--user", help="Username/email (overrides --creds)")
+    p.add_argument("--password", help="Password (overrides --creds)")
+    p.add_argument("--user-sel", help="CSS selector for the user field (optional)")
+    p.add_argument("--pass-sel", help="CSS selector for the password field (optional)")
+    p.add_argument("--submit-sel", help="CSS selector for the submit button (optional)")
+    p.add_argument("--port", type=int, default=9222, help="CDP port (default: 9222)")
+    p.add_argument("--pretty", action="store_true")
+
     args = parser.parse_args()
     fp = open(args.output, "w", encoding="utf-8") if getattr(args, "output", None) else None
 
@@ -985,6 +1811,39 @@ Schema grammar for --schema:
         elif args.command == "linkedin":
             result = linkedin_profile(args.url)
             _emit(result, quiet=False, pretty=args.pretty, fp=fp)
+
+        elif args.command == "browse":
+            target_id = None
+            if args.tab:
+                browser = CDPBrowser(cdp_port=args.port)
+                targets = browser.list_targets()
+                for t in targets:
+                    if t["id"].startswith(args.tab):
+                        target_id = t["id"]
+                        break
+                if not target_id:
+                    print(f"No tab matching '{args.tab}'")
+                    sys.exit(1)
+            browse_mode(target_id=target_id, cdp_port=args.port, start_url=args.url)
+
+        elif args.command == "login":
+            user, password = args.user, args.password
+            if args.creds and not (user and password):
+                c = load_creds(args.creds)
+                if "error" in c:
+                    _emit(c, quiet=False, pretty=args.pretty, fp=fp)
+                    sys.exit(1)
+                user = user or c["user"]
+                password = password or c["password"]
+            if not (user and password):
+                print("Error: provide --creds NAME or --user + --password")
+                sys.exit(1)
+            result = cdp_login(args.url, user, password, cdp_port=args.port,
+                               user_sel=args.user_sel, pass_sel=args.pass_sel,
+                               submit_sel=args.submit_sel)
+            _emit(result, quiet=False, pretty=args.pretty, fp=fp)
+            if result.get("error") or not result.get("success"):
+                sys.exit(1)
 
         else:
             parser.print_help()
